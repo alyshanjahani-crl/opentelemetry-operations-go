@@ -16,8 +16,11 @@ package collector
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/oauth2"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -36,6 +39,13 @@ import (
 
 const (
 	DefaultTimeout = 12 * time.Second // Consistent with Cloud Monitoring's timeout
+	// AccessTokenPath is an environment variable that if present is the filepath
+	// where the collector will look for an access token to authenticate with.
+	// CLOUDSDK_AUTH_ACCESS_TOKEN is an environment variable used by the gcloud cli
+	// so the naming of this is in reference to that.
+	// Other gcp cloud SDKs have requested support for configuring the use of access tokens,
+	// see: https://github.com/googleapis/google-auth-library-python/issues/1165.
+	AccessTokenPath = "CLOUDSDK_AUTH_ACCESS_TOKEN_PATH"
 )
 
 // Config defines configuration for Google Cloud exporter.
@@ -275,7 +285,17 @@ func generateClientOptions(ctx context.Context, clientCfg *ClientConfig, cfg *Co
 			copts = append(copts, option.WithEndpoint(clientCfg.Endpoint))
 		}
 	}
-	if cfg.ImpersonateConfig.TargetPrincipal != "" {
+	// If the AccessTokenPath environment variable is defined, then use that
+	// for credentials.
+	accessTokenFilePath := os.Getenv(AccessTokenPath)
+	if accessTokenFilePath != "" {
+		fts := fileTokenSource{}
+		if _, err := fts.Token(); err != nil {
+			return nil, fmt.Errorf("parsing access token file: %v", err)
+		}
+		tokenSource := oauth2.ReuseTokenSource(nil, fts)
+		copts = append(copts, option.WithTokenSource(tokenSource))
+	} else if cfg.ImpersonateConfig.TargetPrincipal != "" {
 		if cfg.ProjectID == "" {
 			creds, err := google.FindDefaultCredentials(ctx, scopes...)
 			if err != nil {
@@ -316,4 +336,43 @@ func generateClientOptions(ctx context.Context, clientCfg *ClientConfig, cfg *Co
 		return nil, errors.New("no project set in config, or found with application default credentials")
 	}
 	return copts, nil
+}
+
+type fileTokenSource struct {}
+
+func (fts fileTokenSource) Token() (*oauth2.Token, error) {
+	accessTokenFilePath := os.Getenv(AccessTokenPath)
+	if accessTokenFilePath == "" {
+		return nil, fmt.Errorf("%v not defined", accessTokenFilePath)
+	}
+
+	tokenFile, err := os.ReadFile(accessTokenFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("reading file %v", accessTokenFilePath)
+	}
+
+	var t map[string]string
+	if err = json.Unmarshal(tokenFile, &t); err != nil {
+		return nil, errors.New("unmarshalling token")
+	}
+
+	if _, ok := t["accessToken"]; !ok {
+		return nil, errors.New("accessToken field not present")
+	}
+	if _, ok := t["expireTime"]; !ok {
+		return nil, errors.New("expireTime field not present")
+	}
+	accessToken := t["accessToken"]
+
+	expiry, err := time.Parse(time.RFC3339, t["expireTime"])
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse expiry: %v", err)
+	}
+
+	token := &oauth2.Token{
+		AccessToken: accessToken,
+		Expiry: expiry,
+	}
+
+	return token, nil
 }
